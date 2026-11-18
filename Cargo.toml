@@ -14,13 +14,18 @@ cuda-host = { git = "https://github.com/NVIDIA/cuda-rust.git", rev = "8f5f2a5d6c
 cuda-core = { git = "https://github.com/NVIDIA/cuda-rust.git", rev = "8f5f2a5d6c9a5d16a75036fbcc639f751b68d537" }
 # Header parsing + zero-copy views only; the fast GPU loader is ours (see docs/DESIGN.md).
 safetensors = "0.8"
-tokenizers = "=1.0.0-rc.4"
+# `regex`: the Qwen pre-tokenizer is a Split on a regex the built-in engine does not cover.
+tokenizers = { version = "=1.0.0-rc.4", features = ["regex"] }
 libm = "0.2"
 half = "2.7"
 memmap2 = "0.9"
 libc = "0.2"
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["preserve_order"] }
+minijinja = { version = "3.1", features = ["serde", "json", "preserve_order", "loop_controls"] }
+minijinja-contrib = { version = "3.1", features = ["pycompat"] }
+llguidance = { version = "1.9", default-features = false, features = ["lark"] }
+toktrie = "1.9"
 anyhow = "1"
 aq-kernels = { path = "crates/aq-kernels" }
 aq-engine = { path = "crates/aq-engine" }

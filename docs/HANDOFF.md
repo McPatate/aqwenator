@@ -149,6 +149,37 @@ keyed on log lines only (one sat dead for 11 hours).
 
 ---
 
+## OpenAI-compatible serving (2026-11-16, branch `feat/openai-serving`)
+
+What a client written for vLLM or OpenAI needs from `aq-serve`, and what was missing. The
+reference is the README section of the same name (fields, flags, limits, cache behaviour);
+`scripts/serve_check.py` checks it against a running server.
+
+- **Fixed: engine panic on a stop token inside an accepted draft** (`engine.rs`, the
+  `overrun` case). Any request without `ignore_eos` could kill the engine thread; on the 9B,
+  20 chat prompts: 3 served before the panic, 20 of 20 after.
+- **Server**: `/v1/chat/completions` (chat template through minijinja, reasoning split, tool
+  calls parsed or grammar-constrained), sampling (`aq_engine::sample`, exact under
+  speculation), stop strings and stop token ids, `response_format` (llguidance),
+  `logit_bias`, penalties, `min_tokens`, `logprobs` (`shape.rs`), `/health` that turns 503
+  and a process that exits when the engine thread ends, `/metrics`, strict request parsing.
+- **Defaults changed**: a request without `temperature` samples (generation_config.json,
+  else 1.0; `--default-temperature 0` restores greedy); the server listens on 127.0.0.1
+  (`--host`, `AQ_HOST`); `--kv-reserve 4096` instead of a full-context reservation.
+- **Prompt cache in steady state** (`engine.rs`: `cache_slot`, `evict_redundant`, `deeper`
+  in `try_admit`; `Limits::cache_slots`). Checkpoints and snapshots only took a free state
+  slot, so a server whose slots were all parked reused nothing, and a short snapshot kept a
+  longer shared prefix from ever being snapshotted. aq-check leg 4c reproduces both
+  (`AQ_NO_CACHE_EVICT=1` restores the old slot rule and fails the leg).
+  `scripts/cache_replay.py` is the measurement; numbers in the README.
+- **KV reservation**: a request out of pages waits for the next one to end instead of ending
+  with `length` (`Engine::unstall`, `take_cut`; aq-check leg 8).
+- **Not done**: sampling, constraints and logit shaping under `AQ_COEXEC` / `AQ_BG_PREFILL`
+  (the second lane's batches are collected steps later and take their tokens from the
+  device; a picker would need that batch's logits rows, which the lane overwrites); `n` > 1;
+  a state at message boundaries, so that the second of two near-duplicate requests is
+  already a cache hit; multimodal input.
+
 ## Hardware ceilings (2026-11-15, uncommitted at the time of writing: commit signing needs the user)
 
 `aq-ceiling [<model>] [--gb N] [--distinct] [--out f.json]` (crates/aq-engine/src/bin/aq-ceiling.rs)

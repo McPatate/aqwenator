@@ -12,7 +12,8 @@
 //! Exit status is non-zero on any real miss.
 
 use anyhow::{Context, Result};
-use aq_engine::engine::{Engine, Request};
+use aq_engine::engine::{Control, Engine, Request};
+use aq_engine::sample::{Sampler, Sampling, by_id, distribution, uniform};
 use aq_engine::model::{Limits, Model};
 use aq_engine::weights::resolve_model;
 use std::time::Instant;
@@ -124,7 +125,9 @@ fn main() -> Result<()> {
         .min(std::env::var("AQ_CHECK_BUDGET").ok().and_then(|v| v.parse().ok()).unwrap_or(8192));
     let t0 = Instant::now();
     let budget: usize = std::env::var("AQ_CHECK_BUDGET").ok().and_then(|v| v.parse().ok()).unwrap_or(8192);
-    let mut m = Model::load(&dir, Limits { max_tokens: budget, max_seqs: 8, max_ctx: ctx, block_size: 16, kv_budget_bytes: 0, kv_blocks: 0 })?;
+    // AQ_CHECK_CACHE_SLOTS: run every leg with extra cache-only state slots.
+    let cache_slots: usize = std::env::var("AQ_CHECK_CACHE_SLOTS").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+    let mut m = Model::load(&dir, Limits { max_tokens: budget, max_seqs: 8, max_ctx: ctx, block_size: 16, kv_budget_bytes: 0, kv_blocks: 0, cache_slots })?;
     println!(
         "load: {:.2}s, {:.2} GiB on device; prompt {} tokens, {} reference tokens",
         t0.elapsed().as_secs_f64(),
@@ -434,6 +437,84 @@ fn main() -> Result<()> {
         eng.session_cache = true;
     }
 
+    // ---- 4c. steady state: every state slot is held by a parked session, as on a server that
+    // has been up for a while. A new conversation must still get its prompt checkpoint, and a
+    // prefix shared between conversations its snapshot (each evicts a parked entry), also when
+    // a snapshot of a shorter common prefix exists already; the resumed turns must match a
+    // cold engine.
+    {
+        // (What this leg checks does not grow with the prompt: 2304 tokens are enough for a
+        // second snapshot behind the 1040-token one.)
+        let ids = &ids[..ids.len().min(2304)];
+        let slots = (eng.limits().max_seqs + eng.limits().cache_slots) as u64;
+        let ckpt = ids.len().saturating_sub(aq_engine::engine::CKPT_BACKOFF) / 16 * 16;
+        let turn2: Vec<u32> = ids[..ids.len() - 1].iter().copied().chain(ids[..ids.len().min(41)].iter().map(|&t| t ^ 6)).collect();
+        let pre = (ids.len().saturating_sub(64)) / 16 * 16;
+        let tail = |k: u32| -> Vec<u32> { ids[..pre].iter().copied().chain(ids[pre..].iter().map(|&t| t ^ k)).collect() };
+        let shared = ids.len() > 1100;
+        let mut run = |eng: &mut Engine, cached: bool| -> Result<(Vec<Vec<u32>>, Vec<usize>)> {
+            eng.session_cache = cached;
+            eng.clear_cache();
+            let mut reqs: Vec<(Vec<u32>, usize)> =
+                (0..slots as u32).map(|k| (ids[..ids.len().min(40)].iter().map(|&t| t ^ (k + 9)).collect(), 2)).collect();
+            if shared {
+                // Two short prompts that share 1040 tokens with each other and with the long
+                // ones: the second snapshots that much. The first long prompt forks it, the
+                // second forks it too and snapshots the long prefix, the third forks that.
+                let short = |k: u32| -> Vec<u32> { ids[..1040].iter().copied().chain(ids[..200].iter().map(|&t| t ^ k)).collect() };
+                reqs.extend([(short(7), 2), (short(8), 2), (tail(1), 4), (tail(2), 4), (tail(3), 12)]);
+            }
+            reqs.extend([(ids.to_vec(), 8), (turn2.clone(), 12)]);
+            let (mut out, mut reused) = (Vec::new(), Vec::new());
+            let last = reqs.len() - 1;
+            for (k, (prompt, n)) in reqs.into_iter().enumerate() {
+                // The cold engine only runs the two requests it is compared on.
+                if !cached && k != last && k != last - 2 {
+                    out.push(Vec::new());
+                    reused.push(0);
+                    continue;
+                }
+                eng.add(Request { id: 300 + k as u64, prompt, max_new_tokens: n, ignore_eos: true })?;
+                let (mut toks, mut hit) = (Vec::new(), 0);
+                while eng.has_work() {
+                    for e in eng.step()? {
+                        toks.push(e.token);
+                        hit = e.cached;
+                    }
+                }
+                out.push(toks);
+                reused.push(hit);
+            }
+            Ok((out, reused))
+        };
+        let (warm, reused) = run(&mut eng, true)?;
+        let (cold, _) = run(&mut eng, false)?;
+        let s = warm.len() - 2;
+        let same = |k: usize| warm[k].iter().zip(&cold[k]).take_while(|(a, b)| a == b).count();
+        let mut ok = (ckpt == 0 || reused[s + 1] > 0) && same(s + 1) == cold[s + 1].len();
+        println!(
+            "steady state (all {slots} slots parked): turn 2 resumed from {} of {} shared prompt tokens; {}/{} tokens identical to a cold engine",
+            reused[s + 1],
+            ids.len() - 1,
+            same(s + 1),
+            cold[s + 1].len()
+        );
+        if shared {
+            // (A second snapshot is taken only where it saves `SNAPSHOT_MIN_TOKENS` more.)
+            let want = if pre >= 1040 + aq_engine::engine::SNAPSHOT_MIN_TOKENS { pre } else { 1024 };
+            ok &= reused[s - 1] >= want && same(s - 1) == cold[s - 1].len();
+            println!(
+                "steady state shared prefix ({pre} tokens, behind a 1040-token snapshot): conversations reused {:?}; {}/{} tokens identical to a cold engine",
+                &reused[s - 3..s],
+                same(s - 1),
+                cold[s - 1].len()
+            );
+        }
+        failed |= !ok;
+        eng.session_cache = true;
+        eng.clear_cache();
+    }
+
     // ---- 5. shared-prefix snapshots: three prompts share a long prefix with different tails.
     // The second one snapshots the prefix, the third forks from it; the third's tokens must
     // match a cold engine's.
@@ -648,6 +729,187 @@ fn main() -> Result<()> {
             );
             failed |= !ok;
         }
+        // ---- 6b. stop tokens under speculation. A request must end exactly at its stop token
+        // when that token sits inside an accepted draft, and the session it parks must hold
+        // the state of the tokens it emitted, nothing past them: a follow-up that extends the
+        // stopped output has to continue like a cold run of the same prompt.
+        if let Some((_, plain)) = first_off.iter().find(|f| f.0 == "single") {
+            let plain = &plain[0];
+            eng.session_cache = true;
+            let saved_eos = std::mem::take(&mut eng.eos);
+            let before = eng.spec.stop_in_draft;
+            let run1 = |eng: &mut Engine, id: u64, prompt: Vec<u32>, n: usize, cache: bool, spec: usize| -> Result<(Vec<u32>, bool)> {
+                (eng.session_cache, eng.spec_k) = (cache, spec);
+                eng.add(Request { id, prompt, max_new_tokens: n, ignore_eos: false })?;
+                let (mut out, mut stop) = (Vec::new(), false);
+                while eng.has_work() {
+                    for e in eng.step()? {
+                        out.push(e.token);
+                        stop = e.stop;
+                    }
+                }
+                Ok((out, stop))
+            };
+            let (mut tested, mut ok) = (0, true);
+            // Stop tokens: output positions whose token has not occurred earlier in the output.
+            for j in (1..plain.len().min(120)).filter(|&j| !plain[..j].contains(&plain[j])).take(12) {
+                tested += 1;
+                eng.eos = vec![plain[j]];
+                let (got, stop) = run1(&mut eng, 600, prompts[0].clone(), SPEC_TEST_LEN, true, k)?;
+                // (A speculative run may leave the plain run's path at a near-tie, see above:
+                // the stop token then comes elsewhere, or not at all.)
+                let at = got.iter().position(|&t| t == plain[j]);
+                if at.map(|a| a + 1) != stop.then_some(got.len()) {
+                    ok = false;
+                    println!("  stop at token {j}: emitted {} tokens (stop {stop}), first stop token at {at:?}", got.len());
+                    continue;
+                }
+                if !stop {
+                    continue;
+                }
+                eng.eos.clear();
+                let next: Vec<u32> = prompts[0].iter().chain(&got).copied().chain([plain[0]]).collect();
+                // (A cold run prefills the whole prompt: every fourth position is enough.)
+                if tested % 4 != 1 {
+                    continue;
+                }
+                let (warm, _) = run1(&mut eng, 601, next.clone(), 8, true, 0)?;
+                let (cold, _) = run1(&mut eng, 602, next.clone(), 8, false, 0)?;
+                let same = warm.iter().zip(&cold).take_while(|(a, b)| a == b).count();
+                if same < cold.len() {
+                    let p: Vec<u32> = next.iter().chain(&cold[..same]).copied().collect();
+                    run1(&mut eng, 603, p, 1, false, 0)?;
+                    let (_, a, b) = top2(&eng.model.logits()?);
+                    if a - b >= NEAR_TIE {
+                        ok = false;
+                        println!("  stop at token {j}: the follow-up diverges from a cold run after {same} tokens where the margin is {:.3}: REAL MISMATCH", a - b);
+                    }
+                }
+            }
+            eng.clear_cache();
+            println!(
+                "stop under speculation (k={k}): {tested} stop positions, {} inside a fully accepted draft; {}",
+                eng.spec.stop_in_draft - before,
+                if ok { "all end on the stop token and resume like a cold run" } else { "FAIL" }
+            );
+            failed |= !ok;
+            eng.eos = saved_eos;
+        }
+        // ---- 6c. sampling. (1) A seeded request is reproducible, and speculation does not
+        // change it: the token at each position depends on that position's logits and the
+        // seed only, so a sequence decoded alone gives the same tokens with drafts on and off
+        // (same GEMM plan pinning as above; batched, logits move by an ulp with what shares
+        // the step, which sampling turns into a different token now and then). (2) Batched
+        // with drafts, temperature 0 through the host path follows the device's greedy tokens,
+        // so every request reads its own logits rows. (3) The first sampled token follows the
+        // reference distribution: frequencies over many seeds against
+        // softmax(reference logits / T) cut to top-k and top-p.
+        if !eng.coexec && eng.bg_prefill == 0 {
+            let sp = Sampling { temperature: 0.8, top_p: 0.95, top_k: 40, seed: 1234 };
+            // `copies` requests with seeds from `sp.seed` up; `distinct`: one prompt each.
+            let mut sample = |eng: &mut Engine, spec: usize, sp: Sampling, n: usize, copies: u64, distinct: bool| -> Result<Vec<Vec<u32>>> {
+                eng.spec_k = spec;
+                for c in 0..copies {
+                    let ctl = Control { pick: Some(Box::new(Sampler::new(Sampling { seed: sp.seed + c, ..sp }))), stop_ids: Vec::new() };
+                    // (One token: the frequency check below, against the reference logits of
+                    // the whole prompt. Else the first 1024 tokens do.)
+                    let p = &prompts[if distinct { c as usize } else { 0 }];
+                    let prompt = p[..if n == 1 { p.len() } else { p.len().min(1024) }].to_vec();
+                    eng.add_with(Request { id: 700 + c, prompt, max_new_tokens: n, ignore_eos: true }, ctl)?;
+                }
+                let mut out = vec![Vec::new(); copies as usize];
+                while eng.has_work() {
+                    for e in eng.step()? {
+                        out[(e.id - 700) as usize].push(e.token);
+                    }
+                }
+                Ok(out)
+            };
+            let cached = std::mem::replace(&mut eng.session_cache, false);
+            let before = eng.spec;
+            let on = sample(&mut eng, k, sp, 96, 1, false)?;
+            let st = eng.spec;
+            let again = sample(&mut eng, k, sp, 96, 1, false)?;
+            let off = sample(&mut eng, 0, sp, 96, 1, false)?;
+            let other = sample(&mut eng, k, Sampling { seed: 99, ..sp }, 96, 1, false)?;
+            // Two runs with one seed are identical while their logits are. Where rounding
+            // moves a logit (as between the plain and speculative greedy runs above), the
+            // same draw can land on the neighbouring token: accepted when the draw sits
+            // within 0.1 of a boundary of the distribution at the first difference.
+            let mut agree = |eng: &mut Engine, a: &[u32], b: &[u32]| -> Result<String> {
+                let p = a.iter().zip(b).take_while(|(x, y)| x == y).count();
+                if p == a.len() && p == b.len() {
+                    return Ok("identical".into());
+                }
+                eng.spec_k = 0;
+                let prompt: Vec<u32> = prompts[0][..prompts[0].len().min(1024)].iter().chain(&a[..p]).copied().collect();
+                eng.add(Request { id: 399, prompt, max_new_tokens: 1, ignore_eos: true })?;
+                while eng.has_work() {
+                    eng.step()?;
+                }
+                let (u, mut cum, mut near) = (uniform(sp.seed, p as u64), 0.0, f64::MAX);
+                let mut d = distribution(&sp, &eng.model.logits()?);
+                by_id(&mut d);
+                for (_, pr) in d {
+                    cum += pr;
+                    near = near.min((u - cum).abs());
+                }
+                Ok(format!("identical for {p}/96 tokens, then a draw {near:.3} from a boundary: {}", if near < 0.1 { "ok" } else { "DIFFERS" }))
+            };
+            let (rerun, vs_plain) = (agree(&mut eng, &on[0], &again[0])?, agree(&mut eng, &on[0], &off[0])?);
+            // Temperature 0 through the host path, three prompts batched with drafts: every
+            // pick must equal the device's greedy token for its row.
+            let b0 = eng.spec;
+            sample(&mut eng, k, Sampling { temperature: 0.0, ..sp }, 96, 3, true)?;
+            let (picked, repicked) = (eng.spec.picked - b0.picked, eng.spec.repicked - b0.repicked);
+            let ok = !rerun.ends_with("DIFFERS") && !vs_plain.ends_with("DIFFERS") && on != other && picked >= 288 && repicked == 0;
+            println!(
+                "sampling (T={} top_p={} top_k={}, k={k}): same seed again {rerun}; speculative vs plain {vs_plain}; other seed {}; drafted {} accepted {} ({:.0}%); temperature 0 batched x3 with drafts: {repicked}/{picked} host picks differ from the device token",
+                sp.temperature,
+                sp.top_p,
+                sp.top_k,
+                if on != other { "differs" } else { "IDENTICAL" },
+                st.drafted - before.drafted,
+                st.accepted - before.accepted,
+                100.0 * (st.accepted - before.accepted) as f64 / (st.drafted - before.drafted).max(1) as f64
+            );
+            failed |= !ok;
+
+            // Frequencies of the first token over many seeds, against the reference logits
+            // (transformers, `logits_last`) when the golden has them, else our own.
+            let sp = Sampling { temperature: 1.5, top_p: 0.9, top_k: 12, seed: 0 };
+            let refl = as_f32("logits_last").unwrap_or_default();
+            let want = distribution(&sp, if refl.len() == vocab { &refl } else { &lg });
+            const DRAWS: u64 = 1024;
+            // (With the session cache: after the first batch a draw prefills only the prompt's
+            // last tokens, from the prompt checkpoint.)
+            eng.session_cache = true;
+            let mut got: std::collections::HashMap<u32, f64> = std::collections::HashMap::new();
+            let mut seed = 0;
+            while seed < DRAWS {
+                for o in sample(&mut eng, k, Sampling { seed, ..sp }, 1, 8, false)? {
+                    *got.entry(o[0]).or_default() += 1.0 / DRAWS as f64;
+                }
+                seed += 8;
+            }
+            // Total variation distance; sampling noise alone gives about 0.04 at 1024 draws
+            // over a dozen tokens, and bf16 logits against the f32 reference add a little.
+            let tv = 0.5 * (want.iter().map(|(t, p)| (p - got.get(t).copied().unwrap_or(0.0)).abs()).sum::<f64>()
+                + got.iter().filter(|(t, _)| !want.iter().any(|w| w.0 == **t)).map(|(_, f)| f).sum::<f64>());
+            let outside = got.keys().filter(|t| !want.iter().any(|w| w.0 == **t)).count();
+            println!(
+                "sampling frequencies (T={} top_p={} top_k={}, {DRAWS} seeds): {} candidate tokens, top p {:.3}, total variation vs reference {tv:.3}, {outside} token(s) outside the reference set: {}",
+                sp.temperature,
+                sp.top_p,
+                sp.top_k,
+                want.len(),
+                want.first().map_or(0.0, |w| w.1),
+                if tv < 0.1 { "ok" } else { "FAIL" }
+            );
+            failed |= tv >= 0.1;
+            eng.clear_cache();
+            eng.session_cache = cached;
+        }
         (eng.session_cache, eng.spec_k, eng.model.gpu.gemm_min_m) = saved;
         eng.coexec = coexec_saved;
         eng.bg_prefill = bg_saved;
@@ -730,6 +992,57 @@ fn main() -> Result<()> {
             if ok { "identical to a cold run" } else { "DIFFER from a cold run" }
         );
         failed |= !ok;
+    }
+
+    // ---- 8. KV reservation (`Engine::kv_reserve`): a request that reserves only part of its
+    // token limit takes pages as it generates. With room in the pool the output is the same
+    // as with a full reservation. In a pool that cannot hold what two such requests ask for,
+    // both are admitted and run together (a full reservation would run them one after the
+    // other) until the pages run out; then one waits, the other ends as if at its limit when
+    // it runs dry too, its pages let the first go on to its real limit, and nothing fails.
+    {
+        let saved = (eng.session_cache, eng.spec_k, eng.kv_reserve);
+        // (Page accounting does not depend on the prompt: its first 512 tokens do.)
+        let ids = &ids[..ids.len().min(512)];
+        (eng.session_cache, eng.spec_k) = (false, 0);
+        eng.clear_cache();
+        let bs = eng.limits().block_size;
+        let mut run = |eng: &mut Engine, reserve: usize, copies: u64| -> Result<(Vec<Vec<u32>>, usize)> {
+            eng.kv_reserve = reserve;
+            for c in 0..copies {
+                eng.add(Request { id: 800 + c, prompt: ids.to_vec(), max_new_tokens: 96, ignore_eos: true })?;
+            }
+            let (mut out, mut together) = (vec![Vec::new(); copies as usize], 0);
+            while eng.has_work() {
+                let ev = eng.step()?;
+                together = together.max(eng.num_running());
+                for e in ev {
+                    out[(e.id - 800) as usize].push(e.token);
+                }
+            }
+            Ok((out, together))
+        };
+        let (full, _) = run(&mut eng, usize::MAX, 1)?;
+        let (lazy, _) = run(&mut eng, 16, 1)?;
+        // Room for both prompts, their 16 reserved tokens, and about 64 tokens of growth.
+        let target = 2 * (ids.len() + 16).div_ceil(bs) + 4;
+        eng.withhold_pages(eng.free_pages().saturating_sub(target));
+        let before = eng.cache.cut;
+        let (_, serial) = run(&mut eng, usize::MAX, 2)?;
+        let (cut, together) = run(&mut eng, 16, 2)?;
+        let cuts = eng.cache.cut - before;
+        // (Two together need not match the single run token for token: near-ties, see leg 6.)
+        let ok = lazy == full && serial == 1 && together == 2 && cuts == 1 && cut.iter().all(|o| !o.is_empty()) && cut.iter().any(|o| o.len() < 96) && cut.iter().any(|o| o.len() == 96);
+        println!(
+            "kv reservation: growing {} a full reservation ({} tokens); pool of {target} pages, 2 requests of {} + 96 tokens: {serial} at a time reserved in full, {together} with 16 reserved, {cuts} ended early after {:?} tokens: {}",
+            if lazy == full { "identical to" } else { "DIFFERS from" },
+            full[0].len(),
+            ids.len(),
+            cut.iter().map(|o| o.len()).collect::<Vec<_>>(),
+            if ok { "ok" } else { "FAIL" }
+        );
+        failed |= !ok;
+        (eng.session_cache, eng.spec_k, eng.kv_reserve) = saved;
     }
 
     if failed {

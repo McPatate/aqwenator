@@ -16,7 +16,7 @@ run() { # <env string> <reference file> <expect: pass|fail>
   out=$(env $1 timeout "${GATE_TIMEOUT:-1500}" "$CHECK" "$3" "$2" 2>&1)
   local code=$?
   echo "== $(basename "$2") [$1] exit=$code"
-  echo "$out" | grep -E "teacher|greedy vs|batched seq|session|shared|pressure|specul|PASS|FAIL|MISMATCH|rror|panic" | cut -c1-230
+  echo "$out" | grep -E "teacher|greedy vs|batched seq|session|shared|pressure|specul|stop under|PASS|FAIL|MISMATCH|rror|panic" | cut -c1-230
   if { [ "$4" = pass ] && [ $code -eq 0 ]; } || { [ "$4" = fail ] && [ $code -ne 0 ]; }; then pass=$((pass + 1)); else fail=$((fail + 1)); echo "   UNEXPECTED"; fi
 }
 last=

@@ -189,6 +189,9 @@ pub struct Limits {
     pub kv_budget_bytes: usize,
     /// Pages in the pool, resolved at load time from the budget.
     pub kv_blocks: usize,
+    /// Recurrent-state slots beyond `max_seqs`, for the session cache only (parked sessions,
+    /// prompt checkpoints, shared-prefix snapshots). A slot costs the state alone, no KV pages.
+    pub cache_slots: usize,
 }
 
 impl Limits {
@@ -287,6 +290,9 @@ pub struct Model {
     cur_tap: bool,
     /// Logits buffer of the last step that sampled, whichever lane ran it.
     last_logits: u64,
+    /// Row of the logits buffer that holds each sampled row of the last `step`, in the
+    /// caller's sample order.
+    last_rows: Vec<u32>,
     pub use_graphs: bool,
     /// Prefill work lists of the step being run (set by `upload`).
     cur_chunks: usize,
@@ -616,8 +622,8 @@ impl Model {
                     layer.gnorm = gpu.alloc_upload(&ck.f32_vec(&la("norm.weight"))?)?;
                     layer.out_proj = gemm_weight(&mut gpu, &ck, &[la("out_proj.weight")], 0, cfg.value_dim(), q('o'))?;
                     let t = Instant::now();
-                    layer.delta_state = gpu.alloc((lim.max_seqs + 1) * hv * 128 * 128 * 4)?;
-                    layer.conv_state = gpu.alloc((lim.max_seqs + 1) * cfg.conv_dim() * 3 * 2)?;
+                    layer.delta_state = gpu.alloc((lim.max_seqs + 1 + lim.cache_slots) * hv * 128 * 128 * 4)?;
+                    layer.conv_state = gpu.alloc((lim.max_seqs + 1 + lim.cache_slots) * cfg.conv_dim() * 3 * 2)?;
                     gpu.sync()?;
                     state_s += t.elapsed().as_secs_f64();
                 }
@@ -730,7 +736,7 @@ impl Model {
             weight_bytes as f64 / (1u64 << 30) as f64,
             lim.num_blocks(),
             lim.num_blocks() * lim.block_size,
-            lim.max_seqs,
+            lim.max_seqs + lim.cache_slots,
             cfg.state_bytes_per_seq() as f64 / (1 << 20) as f64
         );
 
@@ -814,6 +820,7 @@ impl Model {
             cur_nd_rows: 0,
             cur_tap: false,
             last_logits: 0,
+            last_rows: Vec::new(),
             ref_gdn: std::env::var("AQ_GDN_RECURRENT").as_deref() == Ok("1"),
             ref_attn: std::env::var("AQ_ATTN_NAIVE").as_deref() == Ok("1"),
             tile_attn: std::env::var("AQ_ATTN_TILE").as_deref() == Ok("1"),
@@ -1067,6 +1074,8 @@ impl Model {
         anyhow::ensure!(ns <= lim.max_seqs * MAX_DECODE_ROWS_PER_SEQ, "too many sampled rows");
         self.last_mtp.clear();
         self.last_mtp_rows.clear();
+        // Eager and pure-decode steps compute logits for the sampled rows only, in order.
+        self.last_rows = (0..ns as u32).collect();
         let pure_decode = nseq > 0 && b.n_decode == nseq && ns == nseq && b.tokens.len() == nseq;
         if self.use_graphs && pure_decode && dump.is_none() {
             return self.step_graph(b);
@@ -1234,6 +1243,7 @@ impl Model {
             self.last_mtp = b.sample_rows.iter().map(|&r| all[r as usize]).collect();
             self.last_mtp_rows = b.sample_rows.clone();
         }
+        self.last_rows = b.sample_rows.clone();
         let all = self.gpu.download(self.s.tok, rows)?;
         Ok(b.sample_rows.iter().map(|&r| all[r as usize]).collect())
     }
@@ -2137,6 +2147,14 @@ impl Model {
     pub fn logits_rows(&self, n: usize) -> Result<Vec<f32>> {
         let src = if self.last_logits != 0 { self.last_logits } else { self.s.logits };
         let v: Vec<u16> = self.gpu.download(src, n * self.cfg.vocab_size)?;
+        Ok(v.into_iter().map(|b| bf16::from_bits(b).to_f32()).collect())
+    }
+
+    /// Logits of sampled row `k` of the last `step` on this lane (`k` indexes its result).
+    pub fn logits_row(&self, k: usize) -> Result<Vec<f32>> {
+        let vocab = self.cfg.vocab_size;
+        let row = *self.last_rows.get(k).ok_or_else(|| anyhow::anyhow!("no such sampled row in the last step"))? as u64;
+        let v: Vec<u16> = self.gpu.download(self.s.logits + row * vocab as u64 * 2, vocab)?;
         Ok(v.into_iter().map(|b| bf16::from_bits(b).to_f32()).collect())
     }
 

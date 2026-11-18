@@ -70,4 +70,6 @@ COPY LICENSE /usr/share/doc/aqwenator/LICENSE
 RUN useradd --create-home --uid 10001 aq
 USER aq
 EXPOSE 8000
+# aq-serve listens on localhost by default; in a container the port is published.
+ENV AQ_HOST=0.0.0.0
 ENTRYPOINT ["aq-serve"]

@@ -6,4 +6,5 @@ pub mod draft;
 pub mod engine;
 pub mod gpu;
 pub mod model;
+pub mod sample;
 pub mod weights;

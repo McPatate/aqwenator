@@ -100,6 +100,7 @@ fn main() -> Result<()> {
         block_size: 16,
         kv_budget_bytes: 0,
         kv_blocks: 0,
+        cache_slots: 0,
     };
     let model = Model::load(&dir, limits)?;
     let loaded_s = process_start.elapsed().as_secs_f64();
