@@ -505,6 +505,31 @@ fn main() -> Result<()> {
         failed |= after.forks == before.forks || tie.is_some_and(|m| m >= near_tie);
     }
 
+    // ---- 5b. steady state: every state slot is held by a parked session and requests arrive
+    // one at a time. Two short prompts share 1040 tokens; the second must still snapshot
+    // them, and three longer prompts that start with the same tokens must each fork it.
+    if ids.len() > 2400 {
+        let short = |k: u32| -> Vec<u32> { ids[..1040].iter().copied().chain(ids[..200].iter().map(|&t| t ^ k)).collect() };
+        let long = |k: u32| -> Vec<u32> { ids[..2240].iter().copied().chain(ids[..64].iter().map(|&t| t ^ k)).collect() };
+        let mut reqs: Vec<Vec<u32>> = (0..eng.limits().max_seqs as u32).map(|k| ids[..40].iter().map(|&t| t ^ (k + 9)).collect()).collect();
+        reqs.extend([short(7), short(8), long(1), long(2), long(3)]);
+        eng.session_cache = true;
+        eng.clear_cache();
+        let mut reused = Vec::new();
+        for (k, prompt) in reqs.into_iter().enumerate() {
+            let before = eng.cache.reused_tokens;
+            eng.add(Request { id: 300 + k as u64, prompt, max_new_tokens: 2, ignore_eos: true })?;
+            while eng.has_work() {
+                eng.step()?;
+            }
+            reused.push(eng.cache.reused_tokens - before);
+        }
+        let long = &reused[reused.len() - 3..];
+        println!("shared prefix (1040 tokens, every slot parked, one request at a time): reused {long:?}");
+        failed |= long.iter().any(|&r| r < 1024);
+        eng.clear_cache();
+    }
+
     // ---- 6. speculative decoding: with fixed decode-attention slices, greedy output with
     // speculation on must be token-identical to speculation off, single and batched.
     {

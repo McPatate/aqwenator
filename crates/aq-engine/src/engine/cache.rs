@@ -230,10 +230,19 @@ impl Engine {
         (best.min(prompt.len().saturating_sub(1)) / bs) * bs
     }
 
+    /// A state slot for a checkpoint or a snapshot: a free one, else that of the least
+    /// recently used parked session. Load control protects parked sessions: free slots only.
+    fn cache_slot(&mut self) -> Option<u32> {
+        if self.pool.slots.is_empty() && !self.policy.load_control {
+            self.evict_lru_parked();
+        }
+        self.pool.slots.pop()
+    }
+
     /// Prompt checkpoint of running sequence `i` at its current (page-aligned) position.
-    /// Skipped when no state slot is free.
+    /// Skipped when no state slot can be had.
     pub(super) fn checkpoint(&mut self, i: usize) -> Result<()> {
-        let Some(slot) = self.pool.slots.pop() else { return Ok(()) };
+        let Some(slot) = self.cache_slot() else { return Ok(()) };
         self.model.copy_slot(slot as usize, self.running[i].slot as usize)?;
         self.park_prefix(i, self.running[i].computed, slot);
         Ok(())
@@ -276,7 +285,7 @@ impl Engine {
                 self.drop_snapshot(j);
             }
         }
-        let Some(slot) = self.pool.slots.pop() else { return Ok(()) };
+        let Some(slot) = self.cache_slot() else { return Ok(()) };
         let bs = self.limits().block_size;
         let s = &self.running[i];
         let n = s.computed;
