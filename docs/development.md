@@ -63,6 +63,7 @@ Environment:
 | `AQ_BG_PREFILL=N` | Background prefill lane |
 | `AQ_PROFILE=1\|decode\|prefill` | Per-operation GPU time, printed periodically |
 | `AQ_TRACE=1` | Step and request logs |
+| `AQ_EXPERT_TRACE=<file>` | With `AQ_EXPERT_GB`: record what every layer asked of the expert pool (records needed, guesses for the next two layers), for `aq-replay` |
 | `AQ_LAYERS=N` | Load the first N layers only; `aq-check` then prints each layer's error against the reference and stops |
 | `AQ_KINFO=1` | Registers and shared memory of every kernel |
 | `AQ_DEVICE_GB=N`, `AQ_SMEM_KB=N` | Refuse to allocate past N GiB, and to use more than N KB of shared memory per block: sizes a configuration for a smaller card |
@@ -105,3 +106,19 @@ generated ([benchmarks](benchmarks.md#results)).
 Pushing a tag `vX.Y.Z` builds amd64 and arm64 images with provenance and an SBOM, publishes
 `ghcr.io/<owner>/aqwenator:X.Y.Z` and `:latest`, and attaches the binaries and their SHA-256
 sums to a GitHub release. Versions follow `0.x`: a minor bump may break.
+
+## Replaying expert reads without a model
+
+`aq-replay` (its own crate, no GPU) takes a trace recorded with `AQ_EXPERT_TRACE` and performs
+the reads on a real disk, with the device and host tiers simulated. It is where read policies
+and backends are compared: direct reads from a thread pool, io_uring, and memory-mapped files.
+
+```sh
+cargo build -p aq-replay --release
+python scripts/expert_layout.py <model dir> > run.trace.layout   # on another machine than the recording
+target/release/aq-replay run.trace --probe --backend uring
+target/release/aq-replay run.trace --policy ahead --backend uring --dev-gib 3 --ram-gib 4
+```
+
+The page cache is the host tier of the `mmap` backend: run it under a memory limit
+(`systemd-run --user --scope -p MemoryMax=5G`, or a container) to compare at equal memory.

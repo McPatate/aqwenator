@@ -151,7 +151,7 @@ pub struct Scratch {
     // mixture of experts: router logits, the 8 experts and weights per token, rows grouped
     // by expert, jobs, and the activation and output of each (token, expert) row
     moe_logits: u64,
-    /// Each token's selections (16 u16), then room for a guess of the next layer's.
+    /// Each token's selections (16 u16), then room for guesses of the next two layers'.
     moe_idx: u64,
     moe_w: u64,
     moe_list: u64,
@@ -473,7 +473,7 @@ fn alloc_scratch(gpu: &mut Gpu, cfg: &TextConfig, lim: &Limits, cc_gdn: bool, mt
         mix: gpu.alloc(t * mixw * 2)?,
         delta: gpu.alloc(t * hd * 2)?,
         moe_logits: gpu.alloc(mt * moe_router_ld(cfg) * 2)?,
-        moe_idx: gpu.alloc(mt * 64)?,
+        moe_idx: gpu.alloc(mt * 96)?,
         moe_w: gpu.alloc(mt * ek * 4)?,
         moe_list: gpu.alloc(mt * ek * 4)?,
         moe_jobs: gpu.alloc(if mt > 0 { moe_max_jobs(mt, cfg) * 8 } else { 0 })?,
@@ -2397,19 +2397,24 @@ impl Model {
                 }
                 mark!("moe_route");
                 let paged = self.experts.paged() && l.ex_gate_up.fmt == Fmt::Int4;
-                // The next layer's router on this layer's input names most of what it will select.
-                let next = backbone.get(li + 1).filter(|n| paged && self.experts.ahead > 0 && n.ex_gate_up.fmt == Fmt::Int4);
-                if let Some(n) = next {
-                    g.gemm(t, cap, ld as usize, c.hidden_size, s.h, Weight::bf16(n.router), s.proj, CUDA_R_16BF)?;
-                    unsafe { g.k.moe_route(&st, cfg((tu.div_ceil(8), 1, 1), 256), s.proj as *const u16, ld, (s.moe_idx + (t * 32) as u64) as *mut u16, s.q as *mut f32, tu, ne, self.experts.ahead).map_err(de)? };
+                // The next layers' routers on this layer's input name most of what they will select.
+                let guessed = |n: usize, k: u32| backbone.get(li + n).filter(|x| paged && k > 0 && x.ex_gate_up.fmt == Fmt::Int4);
+                let (next, far) = (guessed(1, self.experts.ahead), guessed(2, self.experts.far));
+                for (i, (n, k)) in [(next, self.experts.ahead), (far, self.experts.far)].into_iter().enumerate() {
+                    if let Some(n) = n {
+                        g.gemm(t, cap, ld as usize, c.hidden_size, s.h, Weight::bf16(n.router), s.proj, CUDA_R_16BF)?;
+                        unsafe { g.k.moe_route(&st, cfg((tu.div_ceil(8), 1, 1), 256), s.proj as *const u16, ld, (s.moe_idx + ((i + 1) * t * 32) as u64) as *mut u16, s.q as *mut f32, tu, ne, k).map_err(de)? };
+                    }
                 }
-                // Each token's selections, then 0xffff up to 16; then the guess, in one read.
-                let mut idx: Vec<u16> = if paged || self.routes.is_some() { g.download(s.moe_idx, t * if next.is_some() { 32 } else { 16 })? } else { Vec::new() };
-                let guess = idx.split_off(idx.len().min(t * 16));
+                // Each token's selections, then 0xffff up to 16; then the guesses, in one read.
+                let regions = if far.is_some() { 3 } else if next.is_some() { 2 } else { 1 };
+                let idx: Vec<u16> = if paged || self.routes.is_some() { g.download(s.moe_idx, t * 16 * regions)? } else { Vec::new() };
+                let part = |i: usize| idx.get(i * t * 16..(i + 1) * t * 16).unwrap_or(&[]);
                 if paged {
-                    self.experts.page(g, l.ex_base, c.num_experts, &idx, l.ex_slots, next.map(|n| (n.ex_base, &guess[..])))?;
+                    self.experts.page(g, l.ex_base, c.num_experts, part(0), l.ex_slots, next.map(|n| (n.ex_base, part(1))), far.map(|n| (n.ex_base, part(2))))?;
                     mark!("moe_page");
                 }
+                let idx = part(0);
                 if let Some(f) = self.routes.as_mut() {
                     use std::io::Write;
                     let head = [li as u32, tu, ek].into_iter().flat_map(u32::to_le_bytes);

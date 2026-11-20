@@ -12,6 +12,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 pub struct Checkpoint {
+    paths: Vec<PathBuf>,
     files: Vec<Mmap>,
     /// The same shards opened with O_DIRECT (None where that is unavailable).
     direct: Vec<Option<std::fs::File>>,
@@ -66,7 +67,13 @@ impl Checkpoint {
         if files.is_empty() {
             bail!("no .safetensors files in {}", dir.display());
         }
-        Ok(Self { files, direct, index })
+        Ok(Self { paths, files, direct, index })
+    }
+
+    /// The shard a tensor is in and the byte offset of its data there.
+    pub fn location(&self, name: &str) -> Result<(&Path, u64)> {
+        let (fi, _, _, s, _) = self.index.get(name).with_context(|| format!("missing tensor {name}"))?;
+        Ok((&self.paths[*fi], *s as u64))
     }
 
     pub fn has(&self, name: &str) -> bool {

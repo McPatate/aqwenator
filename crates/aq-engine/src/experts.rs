@@ -89,6 +89,34 @@ struct Disk {
     jobs: Option<mpsc::Sender<Read>>,
     done: mpsc::Receiver<std::io::Result<()>>,
     threads: Vec<std::thread::JoinHandle<()>>,
+    /// Reads queued and not waited for yet.
+    inflight: usize,
+}
+
+impl Disk {
+    /// Queue reads of `ids` (records not in host memory) into the least recently used host
+    /// slots; how many (fewer than asked when the slots used at `tick` leave no room).
+    fn read(&mut self, host: usize, rec: usize, ne: usize, ids: &[usize], tick: u64) -> Result<usize> {
+        let slots = self.lru.place(ids, tick);
+        for (&id, &s) in ids.iter().zip(&slots) {
+            let (f, first) = &self.src[id / ne];
+            let at = first + ((id % ne) * rec) as u64;
+            let head = (at % ALIGN as u64) as usize;
+            self.head[s as usize] = head;
+            let read = Read { fd: f.as_raw_fd(), at: at - head as u64, buf: host + s as usize * self.stride, cap: (head + rec).next_multiple_of(ALIGN), need: head + rec };
+            self.jobs.as_ref().unwrap().send(read).map_err(de)?;
+        }
+        self.inflight += slots.len();
+        Ok(slots.len())
+    }
+
+    fn wait(&mut self) -> Result<()> {
+        while self.inflight > 0 {
+            self.inflight -= 1;
+            self.done.recv().map_err(de)?.context("reading experts")?;
+        }
+        Ok(())
+    }
 }
 
 pub struct ExpertPool {
@@ -103,11 +131,19 @@ pub struct ExpertPool {
     host: usize,
     disk: Option<Disk>,
     tick: u64,
-    /// Experts named ahead per token (0 = none).
+    /// Experts named ahead per token for the next layer (0 = none), and for the one after it
+    /// when tracing.
     pub ahead: u32,
+    pub far: u32,
     /// Since the last report: experts needed, uploaded when needed, read from disk, forwards,
     /// uploaded ahead.
     stats: [usize; 5],
+    /// AQ_EXPERT_TRACE=<file> (debug): what every paging call was asked, for `aq-replay`.
+    /// Per call, as u32: tokens, then the counts of records needed, guessed for the next layer
+    /// and for the one after, then those records. `<file>.layout` says where records are:
+    /// their size and count per layer, then each layer's shard and offset.
+    trace: Option<std::io::BufWriter<std::fs::File>>,
+    layout: Vec<String>,
 }
 
 impl ExpertPool {
@@ -124,7 +160,7 @@ impl ExpertPool {
         anyhow::ensure!(n == 0 || (h % 128 == 0 && ei % 128 == 0), "4-bit experts need widths that are multiples of 128");
         let budget = |var: &str, unit: usize| std::env::var(var).ok().and_then(|v| v.parse::<f64>().ok()).map_or(n, |g| (g * GIB) as usize / unit).min(n);
         let cap = budget("AQ_EXPERT_GB", rec);
-        let mut pool = Self { p: gpu.alloc_uninit(cap * rec)?, off, used: 0, dev: Lru::default(), host: 0, disk: None, tick: 0, ahead: 0, stats: [0; 5] };
+        let mut pool = Self { p: gpu.alloc_uninit(cap * rec)?, off, used: 0, dev: Lru::default(), host: 0, disk: None, tick: 0, ahead: 0, far: 0, stats: [0; 5], trace: None, layout: vec![format!("{rec} {ne}")] };
         if cap == n {
             return Ok(pool);
         }
@@ -135,6 +171,8 @@ impl ExpertPool {
         };
         floor(cap, "AQ_EXPERT_GB", rec)?;
         pool.dev = Lru::new(cap, n);
+        pool.trace = std::env::var("AQ_EXPERT_TRACE").ok().map(|p| std::fs::File::create(p).map(std::io::BufWriter::new)).transpose()?;
+        pool.far = if pool.trace.is_some() { pool.ahead } else { 0 };
         pool.ahead = std::env::var("AQ_EXPERT_AHEAD").ok().and_then(|v| v.parse().ok()).unwrap_or(8).min(16);
         let stride = rec.next_multiple_of(ALIGN) + ALIGN;
         let ram = budget("AQ_EXPERT_RAM_GB", stride);
@@ -157,7 +195,7 @@ impl ExpertPool {
                     })
                 })
                 .collect();
-            pool.disk = Some(Disk { lru: Lru::new(ram, n), stride, head: vec![0; ram], src: Vec::new(), jobs: Some(jobs), done, threads });
+            pool.disk = Some(Disk { lru: Lru::new(ram, n), stride, head: vec![0; ram], src: Vec::new(), jobs: Some(jobs), done, threads, inflight: 0 });
             ram * stride
         } else {
             n * rec
@@ -182,6 +220,8 @@ impl ExpertPool {
         let v = ck.get(&format!("{experts}.q4r"))?;
         let rec = self.off[4];
         anyhow::ensure!(v.dtype == safetensors::Dtype::U8 && v.bytes.len() == ne * rec, "{experts}.q4r: unexpected layout");
+        let (path, at) = ck.location(&format!("{experts}.q4r"))?;
+        self.layout.push(format!("{} {at}", path.display()));
         if let Some(d) = self.disk.as_mut() {
             let (f, at) = v.direct.context("experts read from the checkpoint need direct I/O")?;
             d.src.push((f.try_clone()?, at));
@@ -200,9 +240,31 @@ impl ExpertPool {
     /// first record is `base`) onto the device over the least recently used ones, and queue
     /// the layer's slot table. Nothing queued may still read the pool. `next` is a guess of
     /// the following layer's selection (its first record, then as `idx`): those are uploaded
-    /// on the side stream, to be there when that layer is paged.
-    pub fn page(&mut self, gpu: &Gpu, base: u32, ne: usize, idx: &[u16], table: u64, next: Option<(u32, &[u16])>) -> Result<()> {
+    /// on the side stream, to be there when that layer is paged. `far` is the same for the
+    /// layer after it, and only goes to the trace.
+    pub fn page(&mut self, gpu: &Gpu, base: u32, ne: usize, idx: &[u16], table: u64, next: Option<(u32, &[u16])>, far: Option<(u32, &[u16])>) -> Result<()> {
         gpu.side_sync()?;
+        if let Some(d) = self.disk.as_mut() {
+            d.wait()?;
+        }
+        if let Some(f) = self.trace.as_mut() {
+            use std::io::Write;
+            if !self.layout.is_empty() {
+                std::fs::write(format!("{}.layout", std::env::var("AQ_EXPERT_TRACE").unwrap_or_default()), self.layout.join("\n") + "\n")?;
+                self.layout.clear();
+            }
+            let ids = |g: Option<(u32, &[u16])>| {
+                let mut v: Vec<u32> = g.iter().flat_map(|g| g.1.iter().filter(|&&e| e != 0xffff).map(|&e| g.0 + e as u32)).collect();
+                v.sort_unstable();
+                v.dedup();
+                v
+            };
+            let lists = [ids(Some((base, idx))), ids(next), ids(far)];
+            let head = [(idx.len() / 16) as u32, lists[0].len() as u32, lists[1].len() as u32, lists[2].len() as u32];
+            for v in head.iter().chain(lists.iter().flatten()) {
+                f.write_all(&v.to_le_bytes())?;
+            }
+        }
         self.tick += 1;
         let (tick, rec) = (self.tick, self.off[4]);
         let mut miss = Vec::new();
@@ -230,19 +292,8 @@ impl ExpertPool {
                 }
             }
             let cold: Vec<usize> = miss.iter().copied().filter(|&id| d.lru.slot[id] == NONE).collect();
-            let slots = d.lru.place(&cold, tick);
-            for (&id, &s) in cold.iter().zip(&slots) {
-                let (f, first) = &d.src[id / ne];
-                let at = first + ((id % ne) * rec) as u64;
-                let head = (at % ALIGN as u64) as usize;
-                d.head[s as usize] = head;
-                let read = Read { fd: f.as_raw_fd(), at: at - head as u64, buf: self.host + s as usize * d.stride, cap: (head + rec).next_multiple_of(ALIGN), need: head + rec };
-                d.jobs.as_ref().unwrap().send(read).map_err(de)?;
-            }
-            for _ in &cold {
-                d.done.recv().map_err(de)?.context("reading experts")?;
-            }
-            self.stats[2] += cold.len();
+            self.stats[2] += d.read(self.host, rec, ne, &cold, tick)?;
+            d.wait()?;
         }
         let slots = self.dev.place(&miss, tick);
         for (&id, &s) in miss.iter().zip(&slots) {
@@ -258,9 +309,8 @@ impl ExpertPool {
             unsafe { gpu.upload_raw(self.p + (s as usize * rec) as u64, src as *const u8, rec)? };
         }
         gpu.upload(table, &self.dev.slot[base as usize..][..ne])?;
-        let Some((nbase, guess)) = next else { return Ok(()) };
         let mut ahead = Vec::new();
-        for id in guess.iter().filter(|&&e| e != 0xffff).map(|&e| (nbase + e as u32) as usize) {
+        for id in next.iter().flat_map(|n| n.1.iter().map(|&e| (n.0, e))).filter(|g| g.1 != 0xffff).map(|(nbase, e)| (nbase + e as u32) as usize) {
             match self.dev.slot[id] {
                 NONE if self.disk.as_ref().is_none_or(|d| d.lru.slot[id] != NONE) => {
                     self.dev.slot[id] = PENDING;
