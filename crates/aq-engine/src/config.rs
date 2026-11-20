@@ -9,6 +9,13 @@ pub struct RopeParameters {
     pub rope_theta: f64,
     #[serde(default = "one")]
     pub partial_rotary_factor: f64,
+    /// Frequencies given to the time, row and column position of a token.
+    #[serde(default = "sections")]
+    pub mrope_section: [u32; 3],
+}
+
+fn sections() -> [u32; 3] {
+    [11, 11, 10]
 }
 
 fn one() -> f64 {

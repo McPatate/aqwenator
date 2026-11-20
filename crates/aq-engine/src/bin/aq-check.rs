@@ -150,6 +150,38 @@ fn main() -> Result<()> {
     let vocab = m.cfg.vocab_size;
     let mut failed = false;
 
+    // ---- image reference (`golden.py --image`): the prompt holds image tokens whose embedding
+    // rows and positions come from the file. One prefill, compared layer by layer.
+    if g.names().contains(&"position_ids") {
+        let (pos, img, ve) = (as_u32("position_ids")?, as_u32("image_rows")?, as_f32("vision_embeds")?);
+        let n = ids.len();
+        let mut toks = ids.clone();
+        for (k, &r) in img.iter().enumerate() {
+            toks[r as usize] = 0x8000_0000 | k as u32;
+        }
+        let mut b = m.single(&toks, 0);
+        let pos = &pos;
+        b.rope_off = (0..n).flat_map(|r| (0..3).map(move |a| pos[a * n + r].wrapping_sub(r as u32))).collect();
+        // The reference rows are bf16 values widened to f32.
+        b.rows = ve.iter().map(|v| (v.to_bits() >> 16) as u16).collect();
+        m.reset_slot(0)?;
+        let mut dump = Vec::new();
+        let first = m.step(&b, Some(&mut dump))?[0];
+        let mut worst = (0f64, 0usize);
+        for (l, ours) in dump.iter().enumerate().take(n_layers - 1) {
+            let (rel, _) = rel_err(ours, &as_f32(&format!("hidden.{}", l + 1))?);
+            if rel > worst.0 {
+                worst = (rel, l);
+            }
+        }
+        let (rel, _) = rel_err(&m.logits()?, &as_f32("logits_last")?);
+        println!("image prompt ({} image tokens of {n}): layers worst rel_l2 {:.2e} (layer {}), logits rel_l2 {rel:.2e}, first token {first} (reference {})", img.len(), worst.0, worst.1, greedy_ref[0]);
+        // With the offsets left at zero the layers are off by 4.7e-1 and the first token still agrees.
+        anyhow::ensure!(first == greedy_ref[0] && rel < 0.05 && worst.0 < 0.1, "image reference check FAILED");
+        println!("PASS");
+        return Ok(());
+    }
+
     // ---- 1. prefill (chunked by the step budget) + per-layer comparison
     m.reset_slot(0)?;
     let mut dump = Vec::new();

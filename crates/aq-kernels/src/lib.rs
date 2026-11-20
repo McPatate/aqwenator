@@ -363,15 +363,17 @@ pub mod kernels {
     use super::*;
     use cuda_device::{DynamicSharedArray, SharedArray, kernel};
 
-    /// out[t, :] = table[ids[t], :]. grid = (T), block = (256).
+    /// out[t, :] = table[ids[t], :], or `rows[ids[t] & 0x7fff_ffff, :]` for an id with the top
+    /// bit set (a row computed elsewhere, e.g. an image token). grid = (T), block = (256).
     #[kernel]
-    pub unsafe fn embed(ids: *const u32, table: *const u16, out: *mut u16, hidden: u32) {
+    pub unsafe fn embed(ids: *const u32, table: *const u16, rows: *const u16, out: *mut u16, hidden: u32) {
         let t = thread::blockIdx_x() as usize;
         let h = hidden as usize;
-        let id = unsafe { *ids.add(t) } as usize;
+        let id = unsafe { *ids.add(t) };
+        let src = if id >> 31 != 0 { unsafe { rows.add((id & 0x7fff_ffff) as usize * h) } } else { unsafe { table.add(id as usize * h) } };
         let mut i = thread::threadIdx_x() as usize;
         while i < h {
-            unsafe { *out.add(t * h + i) = *table.add(id * h + i) };
+            unsafe { *out.add(t * h + i) = *src.add(i) };
             i += thread::blockDim_x() as usize;
         }
     }
@@ -1575,6 +1577,7 @@ pub mod kernels {
         k_cache: *mut u16,
         v_cache: *mut u16,
         tok_pos: *const u32,
+        rope_off: *const u32,
         tok_seq: *const u32,
         block_tables: *const u32,
         max_blocks: u32,
@@ -1582,6 +1585,8 @@ pub mod kernels {
         n_heads: u32,
         n_kv: u32,
         rot_dim: u32,
+        rope_h: u32,
+        rope_w: u32,
         rope_theta: f32,
         eps: f32,
         kv8: u32,
@@ -1620,7 +1625,17 @@ pub mod kernels {
         if d < rot {
             let i = d % half;
             let inv_freq = 1.0 / libm::powf(rope_theta, (2 * i) as f32 / rot as f32);
-            let f = inv_freq * pos as f32;
+            // Three positions per token (time, row, column), interleaved over the frequencies:
+            // `rope_off` holds each one's distance from `pos`, zero for a text token.
+            let axis = if i % 3 == 1 && i < rope_h as usize {
+                1
+            } else if i % 3 == 2 && i < rope_w as usize {
+                2
+            } else {
+                0
+            };
+            let p = (pos as u32).wrapping_add(unsafe { *rope_off.add(t * 3 + axis) });
+            let f = inv_freq * p as f32;
             let c = rb(libm::cosf(f));
             let s = rb(libm::sinf(f));
             // rotate_half: [-x2, x1]

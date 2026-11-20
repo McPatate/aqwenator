@@ -122,6 +122,7 @@ pub struct Scratch {
     tvnt: u64,
     ids: u64,
     tok_pos: u64,
+    rope_off: u64,
     tok_seq: u64,
     seq_start: u64,
     seq_len: u64,
@@ -304,6 +305,13 @@ pub struct Batch {
     /// chunk that does not end the prompt), else `u32::MAX`. Only the MTP head reads it; empty
     /// = unknown for every sequence.
     pub next_tok_last: Vec<u32>,
+    /// Per token, the distance of its three rotary positions (time, row, column) from
+    /// `tok_pos`, as wrapping u32 (empty = zero: text). An image token has a row and a column;
+    /// text after an image is at a position before its index.
+    pub rope_off: Vec<u32>,
+    /// Embedding rows (bf16, `hidden` each) for the tokens whose id has the top bit set: such
+    /// an id indexes these rows instead of the embedding table.
+    pub rows: Vec<u16>,
 }
 
 pub struct Model {
@@ -315,6 +323,11 @@ pub struct Model {
     /// are gathered into.
     embed_host: Option<(Checkpoint, String)>,
     embed_rows: Vec<u8>,
+    /// Device copy of the current batch's `Batch::rows`, grown on demand.
+    rows_dev: u64,
+    rows_cap: usize,
+    /// The last upload left non-zero rotary offsets on the device.
+    rope_dirty: bool,
     final_norm: u64,
     lm_head: Weight,
     /// The bf16 output head, which the MTP shortlist gathers from (0 when only its 8-bit
@@ -449,6 +462,7 @@ fn alloc_scratch(gpu: &mut Gpu, cfg: &TextConfig, lim: &Limits, cc_gdn: bool, mt
         tvnt: gpu.alloc(tcc * 128 * GDN_TC_CHUNK * 2)?,
         ids: gpu.alloc(t * 4)?,
         tok_pos: gpu.alloc(t * 4)?,
+        rope_off: gpu.alloc(t * 12)?,
         tok_seq: gpu.alloc(t * 4)?,
         seq_start: gpu.alloc((sq + 1) * 4)?,
         seq_len: gpu.alloc((sq + 1) * 4)?,
@@ -989,6 +1003,9 @@ impl Model {
             embed,
             embed_host: small_tables.then_some((ck, embed_name)),
             embed_rows: Vec::new(),
+            rows_dev: 0,
+            rows_cap: 0,
+            rope_dirty: false,
             final_norm,
             lm_head,
             head_table,
@@ -1260,6 +1277,8 @@ impl Model {
             seq_slot_out: Vec::new(),
             seq_tap: Vec::new(),
             next_tok_last: Vec::new(),
+            rope_off: Vec::new(),
+            rows: Vec::new(),
         }
     }
 
@@ -1605,6 +1624,10 @@ impl Model {
             }
         }
         self.cur_tap = tn.iter().any(|&n| n > 0);
+        if self.rows_cap < b.rows.len() && self.embed != 0 {
+            self.rows_dev = self.gpu.alloc_uninit(b.rows.len() * 2)?;
+            self.rows_cap = b.rows.len();
+        }
         let (s, g) = (&self.s, &self.gpu);
         if !cs.is_empty() {
             g.upload(s.seq_tap_n, &tn)?;
@@ -1627,8 +1650,13 @@ impl Model {
             let (table, hb) = (ck.get(name)?.bytes, self.cfg.hidden_size * 2);
             self.embed_rows.clear();
             for &tok in &b.tokens {
+                let r = (tok & 0x7fff_ffff) as usize;
                 for _ in 0..self.cfg.hc_count {
-                    self.embed_rows.extend_from_slice(&table[tok as usize * hb..(tok as usize + 1) * hb]);
+                    if tok >> 31 != 0 {
+                        self.embed_rows.extend(b.rows[r * hb / 2..(r + 1) * hb / 2].iter().flat_map(|v| v.to_le_bytes()));
+                    } else {
+                        self.embed_rows.extend_from_slice(&table[r * hb..(r + 1) * hb]);
+                    }
                 }
             }
             g.upload(s.x, &self.embed_rows)?;
@@ -1647,8 +1675,17 @@ impl Model {
                 }
                 g.upload(s.ple_e, &p.rows)?;
             }
+        } else if !b.rows.is_empty() {
+            g.upload(self.rows_dev, &b.rows)?;
         }
         g.upload(s.tok_pos, &b.tok_pos)?;
+        // The offsets stay zero on the device while batches are text.
+        if !b.rope_off.is_empty() || self.rope_dirty {
+            let mut off = b.rope_off.clone();
+            off.resize(b.tokens.len() * 3, 0);
+            g.upload(s.rope_off, &off)?;
+            self.rope_dirty = !b.rope_off.is_empty();
+        }
         g.upload(s.tok_seq, &b.tok_seq)?;
         g.upload(s.seq_start, &b.seq_start)?;
         g.upload(s.seq_len, &b.seq_len)?;
@@ -1705,7 +1742,9 @@ impl Model {
             for (k, (&st, &len)) in b.seq_start.iter().zip(&b.seq_len).enumerate() {
                 let (st, len) = (st as usize, len as usize);
                 for r in st..st + len {
-                    next[r] = if r + 1 < st + len { b.tokens[r + 1] } else { b.next_tok_last.get(k).copied().filter(|&t| t != u32::MAX).unwrap_or(0) };
+                    // A supplied row (top bit) has no id the head can embed: 0 stands in for it.
+                    let t = if r + 1 < st + len { b.tokens[r + 1] } else { b.next_tok_last.get(k).copied().unwrap_or(0) };
+                    next[r] = if t >> 31 == 0 { t } else { 0 };
                 }
             }
             for (j, &r) in b.sample_rows.iter().enumerate() {
@@ -1751,7 +1790,7 @@ impl Model {
         let chain = self.chain_mode;
         if !chain && self.embed != 0 {
             unsafe {
-                g.k.embed(&st, cfg((t as u32, 1, 1), 256), s.ids as *const u32, self.embed as *const u16, s.x as *mut u16, hd)
+                g.k.embed(&st, cfg((t as u32, 1, 1), 256), s.ids as *const u32, self.embed as *const u16, self.rows_dev as *const u16, s.x as *mut u16, hd)
             }
             .map_err(de)?;
             mark!("embed");
@@ -2201,6 +2240,7 @@ impl Model {
                             l.k_cache as *mut u16,
                             l.v_cache as *mut u16,
                             s.tok_pos as *const u32,
+                            s.rope_off as *const u32,
                             s.tok_seq as *const u32,
                             s.tables as *const u32,
                             mb,
@@ -2208,6 +2248,8 @@ impl Model {
                             h,
                             hkv,
                             c.rot_dim() as u32,
+                            c.rope_parameters.mrope_section[1] * 3,
+                            c.rope_parameters.mrope_section[2] * 3,
                             c.rope_parameters.rope_theta as f32,
                             eps,
                             self.kv8 as u32,
