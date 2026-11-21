@@ -3,25 +3,32 @@
 //! after it. The device and host tiers are simulated (LRU over records); the reads are real.
 //! It measures how long a layer waits for the disk under a read policy and a read backend.
 //!
-//!     aq-replay <trace> [--dev-gib 3] [--ram-gib 4] [--policy sync|ahead] [--backend direct|uring|mmap]
-//!               [--threads 8] [--layer-us 300] [--steps N]
+//!     aq-replay <trace> [--dev-gib 3] [--ram-gib 4] [--policy sync|ahead] [--backend direct|uring|buffered|mmap]
+//!               [--threads 8] [--layer-us 300] [--steps N] [--max-secs S] [--fixed] [--sqpoll]
 //!     aq-replay <trace> --probe          random reads of one record at depths 1, 8, 32, 128
 //!
 //! Policies: `sync` reads a record when its layer needs it and waits. `ahead` also starts
 //! reading the guesses for the next two layers and, at a layer, waits only for what that layer
 //! needs. Backends: `direct` is O_DIRECT preads from a thread pool into aligned slots; `uring`
 //! the same reads through one io_uring (Linux); `mmap` copies from a mapping of the files (the
-//! page cache is then the host tier, sized by the machine or the container, and `--ram-gib` is
-//! ignored).
-//! `--layer-us` is the compute time of a layer, spent between its paging calls.
+//! page cache is then the host tier, sized by the machine or the container); `buffered` is
+//! `direct` without O_DIRECT.
+//!
+//! The mapping can be helped (Linux): `--madvise random` turns the kernel's sequential
+//! read-ahead off; `--mmap willneed` asks for a layer's records before touching them and
+//! `--mmap populate` faults them in on the thread pool, whole records at a time; `--mmap-evict`
+//! keeps the `--ram-gib` most recently used records and tells the kernel to drop the others;
+//! with the `ahead` policy the guesses are asked for with MADV_WILLNEED.
+//! `--layer-us` is the compute time of a layer, spent between its paging calls. With `uring`,
+//! `--fixed` registers the host slots with the ring once (no page pinning per read) and
+//! `--sqpoll` lets a kernel thread take the submissions.
 
 use anyhow::{Context, Result, bail};
+use aq_io::{ALIGN, Io, Read, aligned};
 use std::collections::HashMap;
 use std::os::fd::AsRawFd;
-use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
-const ALIGN: usize = 4096;
 const NONE: u32 = u32::MAX;
 
 struct Layout {
@@ -111,123 +118,6 @@ impl Lru {
     }
 }
 
-struct Read {
-    id: u32,
-    fd: i32,
-    at: u64,
-    buf: usize,
-    len: usize,
-}
-
-/// Where the reads go: a pool of threads doing preads, or an io_uring.
-enum Io {
-    Threads { jobs: Option<mpsc::Sender<Read>>, done: mpsc::Receiver<u32>, threads: Vec<std::thread::JoinHandle<()>> },
-    #[cfg(target_os = "linux")]
-    Uring(io_uring::IoUring),
-}
-
-impl Io {
-    fn new(backend: &str, threads: usize) -> Result<Self> {
-        #[cfg(target_os = "linux")]
-        if backend == "uring" {
-            return Ok(Io::Uring(io_uring::IoUring::new(256)?));
-        }
-        anyhow::ensure!(backend != "uring", "io_uring needs Linux");
-        let (jobs, rx) = mpsc::channel::<Read>();
-        let rx = Arc::new(Mutex::new(rx));
-        let (tx, done) = mpsc::channel();
-        let threads = (0..threads)
-            .map(|_| {
-                let (rx, tx) = (rx.clone(), tx.clone());
-                std::thread::spawn(move || {
-                    loop {
-                        let Ok(r) = rx.lock().unwrap().recv() else { break };
-                        let mut got = 0;
-                        while got < r.len {
-                            let n = unsafe { libc::pread(r.fd, (r.buf + got) as *mut libc::c_void, r.len - got, (r.at + got as u64) as libc::off_t) };
-                            if n <= 0 {
-                                break;
-                            }
-                            got += n as usize;
-                        }
-                        if tx.send(r.id).is_err() {
-                            break;
-                        }
-                    }
-                })
-            })
-            .collect();
-        Ok(Io::Threads { jobs: Some(jobs), done, threads })
-    }
-
-    /// Queue a read; `flush` hands the queued ones to the kernel.
-    fn submit(&mut self, r: Read) {
-        match self {
-            Io::Threads { jobs, .. } => jobs.as_ref().unwrap().send(r).unwrap(),
-            #[cfg(target_os = "linux")]
-            Io::Uring(ring) => {
-                let e = io_uring::opcode::Read::new(io_uring::types::Fd(r.fd), r.buf as *mut u8, r.len as u32).offset(r.at).build().user_data(r.id as u64);
-                while unsafe { ring.submission().push(&e) }.is_err() {
-                    ring.submit().expect("io_uring submit");
-                }
-            }
-        }
-    }
-
-    fn flush(&mut self) {
-        #[cfg(target_os = "linux")]
-        if let Io::Uring(ring) = self {
-            ring.submit().expect("io_uring submit");
-        }
-    }
-
-    /// A finished read, if one is.
-    fn try_done(&mut self) -> Option<u32> {
-        match self {
-            Io::Threads { done, .. } => done.try_recv().ok(),
-            #[cfg(target_os = "linux")]
-            Io::Uring(ring) => ring.completion().next().map(|c| {
-                assert!(c.result() > 0, "read failed: {}", c.result());
-                c.user_data() as u32
-            }),
-        }
-    }
-
-    /// The next finished read, waiting for it.
-    fn wait_done(&mut self) -> u32 {
-        loop {
-            if let Some(id) = self.try_done() {
-                return id;
-            }
-            match self {
-                Io::Threads { done, .. } => return done.recv().expect("readers gone"),
-                #[cfg(target_os = "linux")]
-                Io::Uring(ring) => {
-                    ring.submit_and_wait(1).expect("io_uring wait");
-                }
-            }
-        }
-    }
-}
-
-impl Drop for Io {
-    fn drop(&mut self) {
-        #[allow(irrefutable_let_patterns)]
-        if let Io::Threads { jobs, threads, .. } = self {
-            *jobs = None;
-            for t in threads.drain(..) {
-                let _ = t.join();
-            }
-        }
-    }
-}
-
-fn aligned(bytes: usize) -> usize {
-    let mut p = std::ptr::null_mut();
-    assert_eq!(unsafe { libc::posix_memalign(&mut p, ALIGN, bytes) }, 0, "out of memory");
-    p as usize
-}
-
 fn pct(v: &mut [f64], p: f64) -> f64 {
     if v.is_empty() {
         return 0.0;
@@ -249,11 +139,14 @@ fn main() -> Result<()> {
     let Some(trace) = args.first().filter(|a| !a.starts_with("--")) else { bail!("usage: aq-replay <trace> [options]; see the top of main.rs") };
     let (policy, backend) = (opt("--policy", "sync"), opt("--backend", "direct"));
     let (dev_gib, ram_gib): (f64, f64) = (opt("--dev-gib", "3").parse()?, opt("--ram-gib", "4").parse()?);
+    let max_secs: u64 = opt("--max-secs", "0").parse()?;
     let (threads, layer_us, max_steps): (usize, u64, usize) = (opt("--threads", "8").parse()?, opt("--layer-us", "300").parse()?, opt("--steps", "0").parse()?);
-    let mut lay = Layout::open(&opt("--layout", &format!("{trace}.layout")), backend != "mmap")?;
+    let mut lay = Layout::open(&opt("--layout", &format!("{trace}.layout")), backend != "mmap" && backend != "buffered")?;
     let (rec, n) = (lay.rec, lay.layers.len() * lay.per_layer);
     let stride = rec.next_multiple_of(ALIGN) + ALIGN;
-    let mut io = Io::new(&backend, threads)?;
+    let flag = |name: &str| args.iter().any(|a| a == name);
+    let mut io = if backend == "uring" { Io::uring(flag("--sqpoll"))? } else { Io::threads(threads) };
+    let (mm_mode, mm_evict, mm_random) = (opt("--mmap", "fault"), flag("--mmap-evict"), opt("--madvise", "normal") == "random");
     let submit = |io: &mut Io, id: u32, buf: usize, lay: &Layout| {
         let (fi, at) = lay.at(id);
         let head = (at % ALIGN as u64) as usize;
@@ -261,7 +154,11 @@ fn main() -> Result<()> {
     };
 
     if args.iter().any(|a| a == "--probe") {
-        let bufs: Vec<usize> = (0..128).map(|_| aligned(stride)).collect();
+        let region = aligned(128 * stride);
+        if flag("--fixed") {
+            io.register(region, 128 * stride, stride)?;
+        }
+        let bufs: Vec<usize> = (0..128).map(|i| region + i * stride).collect();
         let mut x = 0x9e3779b97f4a7c15u64;
         let mut next = || {
             x ^= x << 13;
@@ -269,7 +166,7 @@ fn main() -> Result<()> {
             x ^= x << 17;
             (x % n as u64) as u32
         };
-        println!("{n} records of {:.2} MiB in {} files; random direct reads, {}", rec as f64 / 1048576.0, lay.files.len(), if backend == "uring" { "io_uring".to_string() } else { format!("{threads} threads") });
+        println!("{n} records of {:.2} MiB in {} files; random direct reads, {}", rec as f64 / 1048576.0, lay.files.len(), if backend == "uring" { format!("io_uring{}{}", if flag("--fixed") { ", fixed buffers" } else { "" }, if flag("--sqpoll") { ", sqpoll" } else { "" }) } else { format!("{threads} threads") });
         for depth in [1usize, 8, 32, 128] {
             let (t, mut lat) = (Instant::now(), Vec::new());
             let mut count = 0;
@@ -298,6 +195,9 @@ fn main() -> Result<()> {
     let (mut dev, mut ram) = (Lru::new(dev_cap, n), Lru::new(ram_cap, n));
     let mmap = backend == "mmap";
     let host = if mmap { 0 } else { aligned(ram_cap * stride) };
+    if flag("--fixed") && !mmap {
+        io.register(host, ram_cap * stride, stride)?;
+    }
     if mmap {
         for f in &lay.files {
             let len = f.metadata()?.len() as usize;
@@ -308,10 +208,28 @@ fn main() -> Result<()> {
             };
             let p = unsafe { libc::mmap(std::ptr::null_mut(), len, libc::PROT_READ, libc::MAP_PRIVATE, f.as_raw_fd(), 0) };
             anyhow::ensure!(p != libc::MAP_FAILED, "mmap failed");
+            if mm_random {
+                unsafe { libc::madvise(p, len, libc::MADV_RANDOM) };
+            }
             lay.maps.push((p as usize, len));
         }
     }
     let scratch = aligned(stride);
+    // A record's pages in the mapping (those it has alone when dropping it).
+    let pages = |lay: &Layout, id: u32, inner: bool| {
+        let (fi, at) = lay.at(id);
+        let (a, b) = (lay.maps[fi].0 + at as usize, lay.maps[fi].0 + at as usize + rec);
+        if inner { (a.next_multiple_of(ALIGN), b / ALIGN * ALIGN) } else { (a / ALIGN * ALIGN, b.next_multiple_of(ALIGN)) }
+    };
+    let advise = |lay: &Layout, id: u32, advice: i32, inner: bool| {
+        let (a, b) = pages(lay, id, inner);
+        unsafe { libc::madvise(a as *mut libc::c_void, b - a, advice) };
+    };
+    #[cfg(target_os = "linux")]
+    let drop_advice = libc::MADV_PAGEOUT;
+    #[cfg(not(target_os = "linux"))]
+    let drop_advice = libc::MADV_DONTNEED;
+    let mut mm_need: Vec<u32> = Vec::new();
     let mut reading: HashMap<u32, ()> = HashMap::new();
     let (mut tick, mut i, mut step_wait, mut step_layers) = (0u64, 0usize, 0.0f64, 0usize);
     let (mut steps, mut layer_wait, mut prev_first) = (Vec::new(), Vec::new(), u32::MAX);
@@ -329,7 +247,7 @@ fn main() -> Result<()> {
         if need.first().is_some_and(|&f| f <= prev_first) && step_layers > 0 {
             steps.push(step_wait);
             (step_wait, step_layers) = (0.0, 0);
-            if max_steps > 0 && steps.len() >= max_steps {
+            if max_steps > 0 && steps.len() >= max_steps || max_secs > 0 && t_all.elapsed().as_secs() >= max_secs {
                 break;
             }
         }
@@ -351,8 +269,7 @@ fn main() -> Result<()> {
             }
             dev_miss += decode as usize;
             if mmap {
-                let (fi, at) = lay.at(id);
-                unsafe { std::ptr::copy_nonoverlapping((lay.maps[fi].0 + at as usize) as *const u8, scratch as *mut u8, rec) };
+                mm_need.push(id);
             } else if reading.contains_key(&id) {
                 wait_for.push(id);
             } else if ram.has(id) {
@@ -366,6 +283,37 @@ fn main() -> Result<()> {
                 wait_for.push(id);
             }
             dev.place(id, tick);
+        }
+        if mmap {
+            for &id in &mm_need {
+                if mm_evict {
+                    if ram.has(id) {
+                        ram.touch(id, tick);
+                    } else if let Some((_, old)) = ram.place(id, tick) {
+                        disk_needed += decode as usize;
+                        if old != NONE {
+                            advise(&lay, old, drop_advice, true);
+                        }
+                    }
+                }
+                match mm_mode.as_str() {
+                    "willneed" => advise(&lay, id, libc::MADV_WILLNEED, false),
+                    "populate" => {
+                        let (a, b) = pages(&lay, id, false);
+                        io.submit(Read { id, fd: -1, at: 0, buf: a, len: b - a });
+                    }
+                    _ => {}
+                }
+            }
+            if mm_mode == "populate" {
+                for _ in &mm_need {
+                    io.wait_done();
+                }
+            }
+            for id in mm_need.drain(..) {
+                let (fi, at) = lay.at(id);
+                unsafe { std::ptr::copy_nonoverlapping((lay.maps[fi].0 + at as usize) as *const u8, scratch as *mut u8, rec) };
+            }
         }
         io.flush();
         while wait_for.iter().any(|id| reading.contains_key(id)) {
@@ -381,6 +329,19 @@ fn main() -> Result<()> {
             for &id in guess {
                 if dev.has(id) {
                     dev.touch(id, tick);
+                } else if mmap {
+                    // The kernel is asked for the guess; with our own eviction it also takes a place.
+                    if policy == "ahead" && !(mm_evict && ram.has(id)) {
+                        disk_ahead += decode as usize;
+                        advise(&lay, id, libc::MADV_WILLNEED, false);
+                        if mm_evict {
+                            if let Some((_, old)) = ram.place(id, tick) {
+                                if old != NONE {
+                                    advise(&lay, old, drop_advice, true);
+                                }
+                            }
+                        }
+                    }
                 } else if !mmap && ram.has(id) && !reading.contains_key(&id) {
                     if dist == 0 {
                         dev.place(id, tick);
@@ -409,7 +370,8 @@ fn main() -> Result<()> {
     let layers_per_step = layer_wait.len() as f64 / steps.len().max(1) as f64;
     let mean = steps.iter().sum::<f64>() / steps.len().max(1) as f64;
     let mib = |c: usize| (c * rec) as f64 / steps.len().max(1) as f64 / 1048576.0;
-    println!("{policy}/{backend}: device {dev_gib} GiB ({dev_cap} records), host {} ({ram_cap}), {layer_us} us per layer; {} forwards in {:.1} s", if mmap { "page cache".into() } else { format!("{ram_gib} GiB") }, steps.len(), t_all.elapsed().as_secs_f64());
+    let backend = format!("{backend}{}{}{}", if flag("--fixed") { "+fixed" } else { "" }, if flag("--sqpoll") { "+sqpoll" } else { "" }, if mmap { format!(" ({mm_mode}{}{})", if mm_random { ", random" } else { "" }, if mm_evict { ", own eviction" } else { "" }) } else { String::new() });
+    println!("{policy}/{backend}: device {dev_gib} GiB ({dev_cap} records), host {} ({ram_cap}), {layer_us} us per layer; {} forwards in {:.1} s", if mmap && !mm_evict { "page cache".into() } else { format!("{ram_gib} GiB") }, steps.len(), t_all.elapsed().as_secs_f64());
     println!("  per forward: {:.0} records needed, {:.1}% not on the device, {:.0} MiB read when needed, {:.0} MiB read ahead ({:.0}% of it used)", needed as f64 / steps.len().max(1) as f64, 100.0 * dev_miss as f64 / needed.max(1) as f64, mib(disk_needed), mib(disk_ahead), 100.0 * ahead_used as f64 / disk_ahead.max(1) as f64);
     println!("  wait per forward: mean {mean:.2} ms, p50 {:.2}, p99 {:.2}; per layer: p50 {:.3}, p99 {:.3}", pct(&mut steps, 0.5), pct(&mut steps, 0.99), pct(&mut layer_wait, 0.5), pct(&mut layer_wait, 0.99));
     println!("  forwards per second at this compute time: {:.1} ({:.1} rows per forward)", 1e3 / (mean + layers_per_step * layer_us as f64 / 1e3), rows_total as f64 / layer_wait.len().max(1) as f64);

@@ -7,6 +7,4 @@ license.workspace = true
 [dependencies]
 anyhow.workspace = true
 libc.workspace = true
-
-[target.'cfg(target_os = "linux")'.dependencies]
-io-uring = "0.7"
+aq-io = { path = "../aq-io" }

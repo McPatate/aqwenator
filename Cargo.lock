@@ -66,6 +66,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "aq-io"
+version = "0.3.0"
+dependencies = [
+ "anyhow",
+ "io-uring",
+ "libc",
+]
+
+[[package]]
 name = "aq-kernels"
 version = "0.3.0"
 dependencies = [
@@ -80,7 +89,7 @@ name = "aq-replay"
 version = "0.3.0"
 dependencies = [
  "anyhow",
- "io-uring",
+ "aq-io",
  "libc",
 ]
 

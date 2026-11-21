@@ -111,7 +111,9 @@ sums to a GitHub release. Versions follow `0.x`: a minor bump may break.
 
 `aq-replay` (its own crate, no GPU) takes a trace recorded with `AQ_EXPERT_TRACE` and performs
 the reads on a real disk, with the device and host tiers simulated. It is where read policies
-and backends are compared: direct reads from a thread pool, io_uring, and memory-mapped files.
+and backends are compared: direct reads from a thread pool, io_uring, buffered reads and
+memory-mapped files. The readers themselves are the `aq-io` crate, which depends on neither
+the engine nor a checkpoint format.
 
 ```sh
 cargo build -p aq-replay --release
@@ -122,3 +124,6 @@ target/release/aq-replay run.trace --policy ahead --backend uring --dev-gib 3 --
 
 The page cache is the host tier of the `mmap` backend: run it under a memory limit
 (`systemd-run --user --scope -p MemoryMax=5G`, or a container) to compare at equal memory.
+Its hints (`--madvise random`, `--mmap willneed|populate`, `--mmap-evict`) are there to give
+the mapping its best case; which of them helps depends on the machine. `--max-secs` bounds a
+run, which the slow configurations need.
