@@ -14,7 +14,7 @@ cuda-host = { git = "https://github.com/NVIDIA/cuda-rust.git", rev = "8f5f2a5d6c
 cuda-core = { git = "https://github.com/NVIDIA/cuda-rust.git", rev = "8f5f2a5d6c9a5d16a75036fbcc639f751b68d537" }
 # Header parsing + zero-copy views only; the fast GPU loader is ours (see docs/DESIGN.md).
 safetensors = "0.8"
-tokenizers = { version = "=1.0.0-rc.4", features = ["regex"] }
+tokenizers = { version = "=1.0.0-rc.5", features = ["regex"] }
 libm = "0.2"
 half = "2.7"
 memmap2 = "0.9"
